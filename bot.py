@@ -2,27 +2,26 @@ import os
 import asyncio
 import logging
 import time
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-
-from aiogram.exceptions import TelegramBadRequest
-
-from aiohttp import web
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 
 # =========================
-# CONFIG (через ENV)
+# CONFIG (ENV)
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8205673929:AAH1bGrq6elIdHyJ9AEwCHgndUKWifFZtf0").strip()
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@sales_engineerings").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "1109896805").strip()
 
-# Render (Web Service) даёт PORT
+# Render Web Service provides PORT
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
@@ -44,17 +43,15 @@ TEXT_NEED_SUB = (
     "Подпишись и нажми /start ещё раз."
 )
 
-# Чтобы не спамить одним и тем же сообщением в группе:
-# хранит время последнего предупреждения для user_id
+
+# =========================
+# Anti-spam предупреждений
+# =========================
 WARN_COOLDOWN_SECONDS = 60
 _last_warn_at: Dict[int, float] = {}
 
 
-# =========================
-# HELPERS
-# =========================
 def _should_warn(user_id: int) -> bool:
-    """Антиспам: предупреждать пользователя не чаще, чем раз в N секунд."""
     now = time.time()
     last = _last_warn_at.get(user_id, 0.0)
     if now - last >= WARN_COOLDOWN_SECONDS:
@@ -63,47 +60,79 @@ def _should_warn(user_id: int) -> bool:
     return False
 
 
+# =========================
+# Кэш подписки (чтобы не долбить API)
+# =========================
+SUB_CACHE_TTL_SECONDS = 60
+_sub_cache: Dict[int, Tuple[bool, float]] = {}
+
+
+def _sub_cache_get(user_id: int) -> Optional[bool]:
+    rec = _sub_cache.get(user_id)
+    if not rec:
+        return None
+    ok, exp = rec
+    if time.time() >= exp:
+        _sub_cache.pop(user_id, None)
+        return None
+    return ok
+
+
+def _sub_cache_set(user_id: int, ok: bool) -> None:
+    _sub_cache[user_id] = (ok, time.time() + SUB_CACHE_TTL_SECONDS)
+
+
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
     """
-    Проверяем подписку пользователя на REQUIRED_CHANNEL.
-    Важно: бот должен быть админом канала, чтобы getChatMember работал стабильно.
+    Проверка подписки через getChatMember.
+    Важно: бот ДОЛЖЕН быть админом канала, иначе часто будут ошибки доступа.
     """
+    cached = _sub_cache_get(user_id)
+    if cached is not None:
+        return cached
+
     try:
         member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        # allowed statuses: creator, administrator, member
-        return member.status in ("creator", "administrator", "member")
-    except TelegramBadRequest as e:
-        # Частые причины:
-        # - bot is not an administrator in the channel
-        # - chat not found / wrong username
-        # - user not found
-        logging.warning("get_chat_member failed: %s", e)
+        ok = member.status in ("creator", "administrator", "member")
+        _sub_cache_set(user_id, ok)
+        return ok
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        # TelegramBadRequest: chat not found / user not found / etc.
+        # TelegramForbiddenError: bot has no rights to check members (not admin in channel)
+        logging.warning("get_chat_member failed (user_id=%s): %s", user_id, e)
+        _sub_cache_set(user_id, False)
         return False
     except Exception as e:
-        logging.exception("Unexpected error in is_subscribed: %s", e)
+        logging.exception("Unexpected error in is_subscribed (user_id=%s): %s", user_id, e)
+        _sub_cache_set(user_id, False)
         return False
 
 
 # =========================
-# AIoHTTP (порт для Render)
+# AIOHTTP web server (для Render healthcheck)
 # =========================
-async def health(request: web.Request) -> web.Response:
-    # Отвечаем и на GET и на HEAD
+async def health(_: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
-async def start_web_server() -> None:
+async def start_web_server() -> web.AppRunner:
+    """
+    ВАЖНО:
+    add_get() по умолчанию САМ добавляет HEAD для того же пути.
+    Поэтому add_head() на те же URL вызывал RuntimeError "method HEAD is already registered".
+    """
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_head("/", health)
-    app.router.add_get("/health", health)
-    app.router.add_head("/health", health)
+    app.router.add_get("/", health)        # HEAD будет добавлен автоматически
+    app.router.add_get("/health", health)  # HEAD будет добавлен автоматически
 
     runner = web.AppRunner(app)
     await runner.setup()
+
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
+
     logging.info("Web server started on 0.0.0.0:%s", PORT)
+    return runner
 
 
 # =========================
@@ -114,66 +143,75 @@ dp = Dispatcher()
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot) -> None:
-    # Проверяем подписку и показываем сообщение ТОЛЬКО если не подписан
-    subscribed = await is_subscribed(bot, message.from_user.id)
-    if not subscribed:
+    user_id = message.from_user.id
+
+    # OWNER bypass (если задан)
+    if OWNER_ID and user_id == OWNER_ID:
+        await message.answer("✅ Доступ открыт (OWNER).")
+        return
+
+    if not await is_subscribed(bot, user_id):
         await message.answer(TEXT_NEED_SUB)
         return
 
-    # Если подписан — без лишнего спама, можно коротко
-    await message.answer("✅ Доступ открыт. Пиши в чат/группу, где установлен бот.")
+    # Для подписанного — без спама, одно стартовое сообщение
+    await message.answer("✅ Доступ открыт. Можешь пользоваться ботом.")
 
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def group_gatekeeper(message: Message, bot: Bot) -> None:
     """
-    Логика для групп:
-    - если не подписан: удаляем сообщение и (иногда) предупреждаем
-    - если подписан: молча пропускаем (ничего не отвечаем!)
+    В группе:
+    - подписан -> молча пропускаем (ничего не отвечаем)
+    - не подписан -> пытаемся удалить сообщение, и иногда выдаём инструкцию
     """
     user_id = message.from_user.id
 
-    # Можно не ограничивать OWNER_ID — но если хочешь, чтобы владелец всегда проходил:
     if OWNER_ID and user_id == OWNER_ID:
         return
 
-    subscribed = await is_subscribed(bot, user_id)
-    if subscribed:
-        return  # никаких "👌 ты подписан" не пишем
+    if await is_subscribed(bot, user_id):
+        return  # молча
 
-    # Не подписан: пытаемся удалить сообщение (бот должен быть админом группы и иметь право delete)
+    # Пытаемся удалить (нужны права админа у бота в группе)
     try:
         await message.delete()
     except Exception as e:
-        logging.warning("Cannot delete message (need admin rights?): %s", e)
+        logging.warning("Cannot delete message (need admin rights in group?): %s", e)
 
-    # Предупреждать не чаще, чем раз в минуту
+    # Предупреждение не чаще, чем раз в минуту
     if _should_warn(user_id):
+        # Сначала пробуем написать в группе
         try:
-            # лучше отвечать в группе как reply (но сообщение уже удалено)
             await message.answer(TEXT_NEED_SUB)
         except Exception:
-            # если нельзя писать в группе — пробуем в личку
+            # Если нельзя писать в группе — пишем в личку
             try:
                 await bot.send_message(user_id, TEXT_NEED_SUB)
             except Exception as e:
-                logging.warning("Cannot send warning to user: %s", e)
+                logging.warning("Cannot send warning to user in DM: %s", e)
 
 
-# (опционально) В личке любые сообщения от НЕ подписанного — мягко направляем на подписку
 @dp.message(F.chat.type == "private")
 async def private_any(message: Message, bot: Bot) -> None:
-    # Не мешаем /start (он уже обработан выше)
+    """
+    В личке:
+    - команды пропускаем (их обработают другие хендлеры)
+    - если не подписан -> показываем инструкцию
+    - если подписан -> молчим (чтобы не засорять)
+    """
     if message.text and message.text.startswith("/"):
         return
 
-    subscribed = await is_subscribed(bot, message.from_user.id)
-    if not subscribed:
+    user_id = message.from_user.id
+
+    if OWNER_ID and user_id == OWNER_ID:
+        return
+
+    if not await is_subscribed(bot, user_id):
         await message.answer(TEXT_NEED_SUB)
         return
 
-    # Если подписан — можешь дальше развивать функционал.
-    # Сейчас молчим, чтобы не засорять.
     return
 
 
@@ -188,11 +226,15 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=PARSE_MODE),
     )
 
-    # Важно: для Render Web Service нужен открытый порт
-    await start_web_server()
+    # Render: поднимаем web server на PORT
+    runner = await start_web_server()
 
-    # Стартуем polling
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # аккуратное завершение web server
+        await runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
