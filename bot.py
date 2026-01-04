@@ -34,7 +34,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8205673929:AAH1bGrq6elIdHyJ9AEwCHgndUKWifFZtf0").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8205673929:AAGkTwUkLUHnapi7Ay1cbI1c1VE9LIsa1fw").strip()
 OWNER_CHANNEL = os.getenv("OWNER_CHANNEL", "@sales_engineerings").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "1109896805").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://...onrender.com/webhook").strip()
