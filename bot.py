@@ -36,7 +36,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8205673929:AAFA-XfUvkATrOUtklhCE0A5eB-tcz6W2
 OWNER_CHANNEL = os.getenv("OWNER_CHANNEL", "@sales_engineerings").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "1109896805").strip()
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/bot.db").strip()
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db").strip()
+
 CHECK_TTL_SECONDS = int(os.getenv("CHECK_TTL_SECONDS", "60"))
 WARN_COOLDOWN_SECONDS = int(os.getenv("WARN_COOLDOWN_SECONDS", "60"))
 
