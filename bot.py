@@ -197,5 +197,24 @@ async def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=PARSE_MODE))
     await dp.start_polling(bot)
 
+# --- Render port binding (for Web Service) ---
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def _run_http_server():
+    port = int(os.environ.get("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+
+threading.Thread(target=_run_http_server, daemon=True).start()
+# --- /Render port binding ---
+
 if __name__ == "__main__":
     asyncio.run(main())
+
